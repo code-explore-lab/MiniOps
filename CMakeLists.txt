@@ -11,6 +11,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(miniops
     src/relu.cpp
     src/add.cpp
+    src/reduce.cpp 
+    src/softmax.cpp
 )
 
 target_include_directories(miniops
@@ -28,3 +30,11 @@ add_executable(test_add
     tests/test_add.cpp
 )
 target_link_libraries(test_add PRIVATE miniops)
+add_executable(test_reduce
+    tests/test_reduce.cpp
+)
+target_link_libraries(test_reduce PRIVATE miniops)
+add_executable(test_softmax
+    tests/test_softmax.cpp
+)
+target_link_libraries(test_softmax PRIVATE miniops)
