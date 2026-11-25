@@ -40,3 +40,9 @@ ninja -C build
 - 分母是所有输入的指数求和
 - 框架直接实现 **LogSoftmax + CrossEntropy 融合算子**，数值更稳、更快
 - 为了防止指数溢出，工程上先减去全局最大值再计算 exp，输出总和接近 1，多用于分类网络最后一层
+
+## OpenMP vs SIMD vs SIMT
+
+- **OpenMP：多核并行（多线程，共享内存，CPU 多个核心）**
+- **SIMD：单核心内部，指令级数据并行（CPU 向量寄存器，AVX2/AVX512）**
+- **SIMT：GPU 的并行模型（NVIDIA CUDA 核心，线程束 warp）**

@@ -8,10 +8,25 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 生成 compile_commands.json，供 clangd / C/C++ 插件解析 include 路径
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# OpenMP 依赖编译器自带的运行时。当前默认的 TDM-GCC 10.3 只有 omp.h、
+# 没有 libgomp，开启后会在链接阶段失败；所以默认关闭，OpenMP 构建使用
+# scripts/build-openmp.bat（clang++ 22 + libomp）。
+option(MINIOPS_ENABLE_OPENMP "Build MatMul with OpenMP" OFF)
+
+if(MINIOPS_ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+endif()
+
+if(MSVC)
+    set(MINIOPS_WARNING_FLAGS /W4)
+else()
+    set(MINIOPS_WARNING_FLAGS -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(miniops
     src/relu.cpp
     src/add.cpp
-    src/reduce.cpp 
+    src/reduce.cpp
     src/softmax.cpp
     src/matmul.cpp
 )
@@ -21,8 +36,16 @@ target_include_directories(miniops
 )
 
 target_compile_options(miniops PRIVATE
-    -Wall -Wextra -Wpedantic
+    ${MINIOPS_WARNING_FLAGS}
 )
+
+if(MINIOPS_ENABLE_OPENMP)
+    # PUBLIC：测试和 benchmark 也需要 OpenMP 头文件、编译选项和运行时。
+    target_link_libraries(miniops PUBLIC OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP enabled (${OpenMP_CXX_FLAGS})")
+else()
+    message(STATUS "OpenMP disabled (MINIOPS_ENABLE_OPENMP=OFF)")
+endif()
 add_executable(test_relu
     tests/test_relu.cpp
 )
@@ -49,5 +72,5 @@ add_executable(benchmark_matmul
 )
 target_link_libraries(benchmark_matmul PRIVATE miniops)
 target_compile_options(benchmark_matmul PRIVATE
-    -Wall -Wextra -Wpedantic
+    ${MINIOPS_WARNING_FLAGS}
 )

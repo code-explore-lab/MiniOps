@@ -11,6 +11,10 @@
 #include <iostream>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace {
 
 constexpr float kRelEps = 1e-4f;
@@ -26,6 +30,15 @@ const Candidate kCandidates[] = {
     {"naive", &miniops::matmul},
     {"ikj", &miniops::matmul_ikj},
     {"blocking", &miniops::matmul_blocking},
+    {"blocking_ptr", &miniops::matmul_blocking_ptr},
+    {"reg4", &miniops::matmul_reg4},
+    {"reg8", &miniops::matmul_reg8},
+    {"reg16", &miniops::matmul_reg16},
+    {"rows2", &miniops::matmul_rows2},
+    {"rows4", &miniops::matmul_rows4},
+    {"rows8", &miniops::matmul_rows8},
+    {"omp", &miniops::matmul_omp},
+    {"omp_ikj", &miniops::matmul_omp_ikj},
 };
 constexpr int kCandidateCount =
     static_cast<int>(sizeof(kCandidates) / sizeof(kCandidates[0]));
@@ -66,7 +79,8 @@ std::vector<float> make_matrix(int rows, int cols, int mod, float scale) {
 }
 
 void check_case(const char *label, int m, int n, int k,
-                const std::vector<float> &a, const std::vector<float> &b) {
+                const std::vector<float> &a, const std::vector<float> &b,
+                bool verbose) {
   std::vector<float> ref(static_cast<std::size_t>(m) * n);
   matmul_ref(a.data(), b.data(), ref.data(), m, n, k);
 
@@ -79,7 +93,9 @@ void check_case(const char *label, int m, int n, int k,
       std::exit(1);
     }
   }
-  std::cout << "[PASS] " << label << " (" << kCandidateCount << " impls)\n";
+  if (verbose) {
+    std::cout << "[PASS] " << label << " (" << kCandidateCount << " impls)\n";
+  }
 }
 
 void check_invalid_inputs() {
@@ -96,33 +112,49 @@ void check_invalid_inputs() {
             << " impls)\n";
 }
 
-} // namespace
-
-int main() {
-  // Case1: 1x1 @ 1x1 = 1x1
-  check_case("1x1 @ 1x1", 1, 1, 1, {2.5f}, {4.0f});
+void run_shape_cases(bool verbose) {
+  // Case1: 1x1 @ 1x1 = 1x1（行数少于线程数）
+  check_case("1x1 @ 1x1", 1, 1, 1, {2.5f}, {4.0f}, verbose);
 
   // Case2: 2x3 @ 3x2 = 2x2
   check_case("2x3 @ 3x2", 2, 2, 3, {1, 2, 3, 4, 5, 6},
-             {10, 20, 30, 40, 50, 60});
+             {10, 20, 30, 40, 50, 60}, verbose);
 
   // Case3: 3x4 @ 4x5 = 3x5
   check_case("3x4 @ 4x5", 3, 5, 4, make_matrix(3, 4, 20, 0.1f),
-             make_matrix(4, 5, 20, 0.2f));
+             make_matrix(4, 5, 20, 0.2f), verbose);
 
   // Case4: 64x64 @ 64x64
   check_case("64x64 @ 64x64", 64, 64, 64, make_matrix(64, 64, 10, 1.0f),
-             make_matrix(64, 64, 7, 1.0f));
+             make_matrix(64, 64, 7, 1.0f), verbose);
 
   // Case5: 127x65 @ 65x33，非对称且三维都不能被分块大小整除
   check_case("127x65 @ 65x33", 127, 33, 65, make_matrix(127, 65, 13, 0.01f),
-             make_matrix(65, 33, 17, 0.02f));
+             make_matrix(65, 33, 17, 0.02f), verbose);
 
   // Case6: 37x29 @ 29x41，再覆盖一组小质数尺寸
   check_case("37x29 @ 29x41", 37, 41, 29, make_matrix(37, 29, 11, 0.05f),
-             make_matrix(29, 41, 19, 0.03f));
+             make_matrix(29, 41, 19, 0.03f), verbose);
+}
 
+} // namespace
+
+int main() {
+  run_shape_cases(true);
   check_invalid_inputs();
+
+#ifdef _OPENMP
+  // 同一套形状在多个线程数下重复验证：并行只改变行划分，
+  // 每个输出元素仍由单线程按相同顺序累加，结果应与串行一致。
+  const int thread_counts[] = {1, 2, 3, 4, 8, 16};
+  for (int threads : thread_counts) {
+    omp_set_num_threads(threads);
+    run_shape_cases(false);
+    std::cout << "[PASS] all shapes with " << threads << " OpenMP thread(s)\n";
+  }
+#else
+  std::cout << "[INFO] built without OpenMP; matmul_omp runs serially\n";
+#endif
 
   std::cout << "\n✅ All matmul tests passed (" << kCandidateCount
             << " implementations)!\n";
