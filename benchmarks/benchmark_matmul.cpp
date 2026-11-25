@@ -1,6 +1,7 @@
 // benchmarks/benchmark_matmul.cpp
 //
-// 朴素 MatMul 基线计时（单线程）。
+// MatMul 多实现对比计时（均为单线程）。
+// 同一次运行内，各实现按轮转顺序交替测，尽量减小温度/频率漂移带来的偏差；
 // 计时区间内只调用算子，输入输出内存在计时前一次性分配。
 // 默认统计中位数（median），同时输出均值和标准差用于判断稳定性。
 //
@@ -8,8 +9,8 @@
 //   benchmark_matmul [--repeats N] [--warmup N] [--sizes 64,128,...]
 //                    [--csv path.csv]
 //
-// 不指定 --repeats 时自动选择重复次数：以约 500 ms 的采样总时长为目标，
-// 小矩阵多测、大矩阵少测，最少 7 次、最多 2001 次。
+// 不指定 --repeats 时自动选择重复次数：以最慢实现约 500 ms 的采样总时长为
+// 目标，最少 7 次、最多 2001 次。所有实现使用相同的重复次数。
 //
 // 必须使用 Release 构建，否则数据没有参考价值。
 
@@ -29,14 +30,28 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr const char *kVersion = "naive";
 constexpr int kThreads = 1;
-
 constexpr int kMinRepeats = 7;
 constexpr int kMaxRepeats = 2001;
 constexpr double kTargetSampleMs = 500.0;
 
+using MatmulFn = void (*)(const float *, const float *, float *, int, int, int);
+
+struct Impl {
+  const char *name;
+  MatmulFn fn;
+};
+
+// 第一项必须是 naive，它作为每个规模的加速比基线。
+const Impl kImpls[] = {
+    {"naive", &miniops::matmul},
+    {"ikj", &miniops::matmul_ikj},
+    {"blocking", &miniops::matmul_blocking},
+};
+constexpr int kImplCount = static_cast<int>(sizeof(kImpls) / sizeof(kImpls[0]));
+
 struct CaseResult {
+  const char *version;
   int m, n, k;
   int repeats;
   double median_ms;
@@ -44,6 +59,7 @@ struct CaseResult {
   double min_ms;
   double std_ms;
   double gflops;
+  double speedup;
   double checksum;
 };
 
@@ -71,58 +87,9 @@ void fill_random(std::vector<float> &v, std::uint32_t seed) {
   }
 }
 
-// M = N = K = size
-// auto_repeats 为 true 时，先试跑一次，按目标采样时长决定重复次数。
-CaseResult run_case(int size, int warmup, int repeats, bool auto_repeats) {
-  const std::size_t elems_a = static_cast<std::size_t>(size) * size;
-  std::vector<float> a(elems_a);
-  std::vector<float> b(elems_a);
-  std::vector<float> c(elems_a);
-
-  fill_random(a, 12345u + static_cast<std::uint32_t>(size));
-  fill_random(b, 67890u + static_cast<std::uint32_t>(size));
-
-  // 预热：让缓存、频率和分支预测进入稳定状态，不计入结果。
-  for (int w = 0; w < warmup; ++w) {
-    miniops::matmul(a.data(), b.data(), c.data(), size, size, size);
-  }
-
-  if (auto_repeats) {
-    const auto probe_start = Clock::now();
-    miniops::matmul(a.data(), b.data(), c.data(), size, size, size);
-    const auto probe_end = Clock::now();
-    const double probe_ms = to_ms(probe_end - probe_start);
-    const double wanted = kTargetSampleMs / probe_ms;
-    if (wanted < kMinRepeats) {
-      repeats = kMinRepeats;
-    } else if (wanted > kMaxRepeats) {
-      repeats = kMaxRepeats;
-    } else {
-      repeats = static_cast<int>(wanted + 0.5);
-    }
-  }
-
-  std::vector<double> samples;
-  samples.reserve(static_cast<std::size_t>(repeats));
-  for (int r = 0; r < repeats; ++r) {
-    const auto start = Clock::now();
-    miniops::matmul(a.data(), b.data(), c.data(), size, size, size);
-    const auto end = Clock::now();
-    samples.push_back(to_ms(end - start));
-  }
-
-  // 在计时区间外读取结果，既做健全性检查，也防止结果被完全丢弃。
-  double checksum = 0.0;
-  bool finite = true;
-  for (float x : c) {
-    checksum += x;
-    finite = finite && std::isfinite(x);
-  }
-  if (!finite) {
-    std::fprintf(stderr, "[ERROR] %dx%d result contains NaN/Inf\n", size, size);
-    std::exit(1);
-  }
-
+CaseResult summarize(const Impl &impl, int size, int repeats,
+                     const std::vector<double> &samples, double baseline_ms,
+                     double checksum) {
   const double median_ms = median_of(samples);
   const double mean_ms =
       std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
@@ -138,9 +105,93 @@ CaseResult run_case(int size, int warmup, int repeats, bool auto_repeats) {
   // 2 * M * N * K 次浮点运算；毫秒换算成秒。
   const double gflops =
       (2.0 * size * size * size) / (median_ms * 1e-3) / 1e9;
+  const double speedup = baseline_ms / median_ms;
 
-  return CaseResult{size, size, size, repeats, median_ms, mean_ms,
-                    min_ms, std_ms, gflops, checksum};
+  return CaseResult{impl.name, size, size, size, repeats, median_ms,
+                    mean_ms, min_ms, std_ms, gflops, speedup, checksum};
+}
+
+// M = N = K = size，所有实现交替测量。
+std::vector<CaseResult> run_size(int size, int warmup, int repeats,
+                                 bool auto_repeats) {
+  const std::size_t elems = static_cast<std::size_t>(size) * size;
+  std::vector<float> a(elems);
+  std::vector<float> b(elems);
+  fill_random(a, 12345u + static_cast<std::uint32_t>(size));
+  fill_random(b, 67890u + static_cast<std::uint32_t>(size));
+
+  // 每个实现独立输出，避免互相覆盖，也便于最后统一校验。
+  std::vector<std::vector<float>> c(kImplCount);
+  for (auto &buf : c) {
+    buf.assign(elems, 0.0f);
+  }
+
+  // 预热：让缓存、频率和分支预测进入稳定状态，不计入结果。
+  for (int w = 0; w < warmup; ++w) {
+    for (int i = 0; i < kImplCount; ++i) {
+      kImpls[i].fn(a.data(), b.data(), c[i].data(), size, size, size);
+    }
+  }
+
+  if (auto_repeats) {
+    // 用最慢实现的试跑时间决定重复次数，保证每个实现都有足够样本。
+    double slowest_ms = 0.0;
+    for (int i = 0; i < kImplCount; ++i) {
+      const auto start = Clock::now();
+      kImpls[i].fn(a.data(), b.data(), c[i].data(), size, size, size);
+      const auto end = Clock::now();
+      slowest_ms = std::max(slowest_ms, to_ms(end - start));
+    }
+    const double wanted = kTargetSampleMs / slowest_ms;
+    if (wanted < kMinRepeats) {
+      repeats = kMinRepeats;
+    } else if (wanted > kMaxRepeats) {
+      repeats = kMaxRepeats;
+    } else {
+      repeats = static_cast<int>(wanted + 0.5);
+    }
+  }
+
+  std::vector<std::vector<double>> samples(kImplCount);
+  for (auto &s : samples) {
+    s.reserve(static_cast<std::size_t>(repeats));
+  }
+
+  // 轮转顺序：每轮把上一个实现排到最后，避免某个实现总是处于固定缓存状态。
+  for (int r = 0; r < repeats; ++r) {
+    for (int t = 0; t < kImplCount; ++t) {
+      const int i = (r + t) % kImplCount;
+      const auto start = Clock::now();
+      kImpls[i].fn(a.data(), b.data(), c[i].data(), size, size, size);
+      const auto end = Clock::now();
+      samples[i].push_back(to_ms(end - start));
+    }
+  }
+
+  // 在计时区间外读取结果，既做健全性检查，也防止结果被完全丢弃。
+  std::vector<double> checksums(kImplCount, 0.0);
+  for (int i = 0; i < kImplCount; ++i) {
+    bool finite = true;
+    for (float x : c[i]) {
+      checksums[i] += x;
+      finite = finite && std::isfinite(x);
+    }
+    if (!finite) {
+      std::fprintf(stderr, "[ERROR] %s %dx%d result contains NaN/Inf\n",
+                   kImpls[i].name, size, size);
+      std::exit(1);
+    }
+  }
+
+  // kImpls[0]（naive）是加速比基线。
+  const double baseline_ms = median_of(samples[0]);
+  std::vector<CaseResult> results;
+  results.reserve(kImplCount);
+  for (int i = 0; i < kImplCount; ++i) {
+    results.push_back(
+        summarize(kImpls[i], size, repeats, samples[i], baseline_ms, checksums[i]));
+  }
+  return results;
 }
 
 std::vector<int> parse_sizes(const char *text) {
@@ -173,7 +224,7 @@ void print_usage(const char *argv0) {
   std::printf(
       "Usage: %s [--repeats N] [--warmup N] [--sizes 64,128,...] [--csv FILE]\n"
       "  --repeats  fixed number of timed runs per size (default: auto)\n"
-      "             auto targets ~500 ms of samples, 7 to 2001 runs\n"
+      "             auto targets ~500 ms of the slowest impl, 7 to 2001 runs\n"
       "  --warmup   number of untimed warm-up runs per size (default: 2)\n"
       "  --sizes    comma-separated matrix sizes, M=N=K (default: "
       "64,128,256,512,1024)\n"
@@ -190,11 +241,11 @@ bool write_csv(const char *path, const std::vector<CaseResult> &results,
   }
   std::fprintf(fp,
                "version,threads,size,median_ms,mean_ms,min_ms,std_ms,gflops,"
-               "checksum,repeats,warmup\n");
+               "speedup,checksum,repeats,warmup\n");
   for (const CaseResult &r : results) {
-    std::fprintf(fp, "%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.4f,%.6f,%d,%d\n",
-                 kVersion, kThreads, r.m, r.median_ms, r.mean_ms, r.min_ms,
-                 r.std_ms, r.gflops, r.checksum, r.repeats, warmup);
+    std::fprintf(fp, "%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.4f,%.3f,%.6f,%d,%d\n",
+                 r.version, kThreads, r.m, r.median_ms, r.mean_ms, r.min_ms,
+                 r.std_ms, r.gflops, r.speedup, r.checksum, r.repeats, warmup);
   }
   std::fclose(fp);
   return true;
@@ -236,8 +287,11 @@ int main(int argc, char **argv) {
   }
 
   std::printf("MiniOps MatMul Benchmark\n");
-  std::printf("version=%s threads=%d layout=row-major dtype=float\n", kVersion,
-              kThreads);
+  std::printf("versions=");
+  for (int i = 0; i < kImplCount; ++i) {
+    std::printf("%s%s", i == 0 ? "" : ",", kImpls[i].name);
+  }
+  std::printf(" threads=%d layout=row-major dtype=float\n", kThreads);
   if (auto_repeats) {
     std::printf("warmup=%d repeats=auto(target %.0f ms, %d..%d) "
                 "statistic=median\n",
@@ -252,20 +306,24 @@ int main(int argc, char **argv) {
                "timings are not valid for reports.\n");
 #endif
 
-  std::printf("\n| size | threads | repeats | median_ms | mean_ms | min_ms | "
-              "std_ms | GFLOP/s | checksum |\n");
-  std::printf("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-              "---: |\n");
+  std::printf("\n| version | size | threads | repeats | median_ms | mean_ms | "
+              "min_ms | std_ms | GFLOP/s | speedup | checksum |\n");
+  std::printf("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+              "| ---: | ---: |\n");
 
   std::vector<CaseResult> results;
-  results.reserve(sizes.size());
+  results.reserve(sizes.size() * kImplCount);
   for (int size : sizes) {
     std::fprintf(stderr, "[run] %dx%dx%d ...\n", size, size, size);
-    const CaseResult r = run_case(size, warmup, repeats, auto_repeats);
-    results.push_back(r);
-    std::printf("| %d | %d | %d | %.3f | %.3f | %.3f | %.3f | %.3f | %.6f |\n",
-                r.m, kThreads, r.repeats, r.median_ms, r.mean_ms, r.min_ms,
-                r.std_ms, r.gflops, r.checksum);
+    std::vector<CaseResult> case_results =
+        run_size(size, warmup, repeats, auto_repeats);
+    for (const CaseResult &r : case_results) {
+      results.push_back(r);
+      std::printf("| %s | %d | %d | %d | %.3f | %.3f | %.3f | %.3f | %.3f | "
+                  "%.3f | %.6f |\n",
+                  r.version, r.m, kThreads, r.repeats, r.median_ms, r.mean_ms,
+                  r.min_ms, r.std_ms, r.gflops, r.speedup, r.checksum);
+    }
     std::fflush(stdout);
   }
 

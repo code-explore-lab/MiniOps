@@ -1,16 +1,37 @@
 // tests/test_matmul.cpp
+//
+// 所有 MatMul 实现都必须与朴素参考实现一致。
+// 这里用显式检查而不是 assert：Release 构建定义了 NDEBUG，assert 会失效。
+
 #include "miniops/operators.hpp"
-#include <cassert>
+
+#include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <cstdlib>
 #include <iostream>
+#include <vector>
 
+namespace {
 
-static constexpr float eps = 1e-4f;
+constexpr float kRelEps = 1e-4f;
 
-// 辅助：朴素参考实现（和算子逻辑一致，用于校验）
-static void matmul_ref(const float *a, const float *b, float *c, int m, int n,
-                       int k) {
+using MatmulFn = void (*)(const float *, const float *, float *, int, int, int);
+
+struct Candidate {
+  const char *name;
+  MatmulFn fn;
+};
+
+const Candidate kCandidates[] = {
+    {"naive", &miniops::matmul},
+    {"ikj", &miniops::matmul_ikj},
+    {"blocking", &miniops::matmul_blocking},
+};
+constexpr int kCandidateCount =
+    static_cast<int>(sizeof(kCandidates) / sizeof(kCandidates[0]));
+
+// 辅助：朴素参考实现
+void matmul_ref(const float *a, const float *b, float *c, int m, int n, int k) {
   if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c)
     return;
   for (int i = 0; i < m; ++i) {
@@ -24,101 +45,86 @@ static void matmul_ref(const float *a, const float *b, float *c, int m, int n,
   }
 }
 
-// 辅助：逐元素对比
-static bool allclose(const float *lhs, const float *rhs, int len) {
+// 相对 + 绝对容差比较。不同累加顺序会带来少量浮点差异。
+bool allclose(const float *lhs, const float *rhs, int len) {
   for (int i = 0; i < len; i++) {
-    if (std::fabs(lhs[i] - rhs[i]) > eps) {
+    const float scale =
+        std::max({1.0f, std::fabs(lhs[i]), std::fabs(rhs[i])});
+    if (std::fabs(lhs[i] - rhs[i]) > kRelEps * scale) {
       return false;
     }
   }
   return true;
 }
 
+std::vector<float> make_matrix(int rows, int cols, int mod, float scale) {
+  std::vector<float> v(static_cast<std::size_t>(rows) * cols);
+  for (std::size_t i = 0; i < v.size(); i++) {
+    v[i] = static_cast<float>(static_cast<int>(i % mod)) * scale;
+  }
+  return v;
+}
+
+void check_case(const char *label, int m, int n, int k,
+                const std::vector<float> &a, const std::vector<float> &b) {
+  std::vector<float> ref(static_cast<std::size_t>(m) * n);
+  matmul_ref(a.data(), b.data(), ref.data(), m, n, k);
+
+  for (const Candidate &cand : kCandidates) {
+    // 用哨兵值预填充，确保实现必须自己写满整个输出。
+    std::vector<float> out(static_cast<std::size_t>(m) * n, -12345.0f);
+    cand.fn(a.data(), b.data(), out.data(), m, n, k);
+    if (!allclose(out.data(), ref.data(), m * n)) {
+      std::cerr << "[FAIL] " << label << " (" << cand.name << ")\n";
+      std::exit(1);
+    }
+  }
+  std::cout << "[PASS] " << label << " (" << kCandidateCount << " impls)\n";
+}
+
+void check_invalid_inputs() {
+  std::vector<float> buf(64, 1.0f);
+  for (const Candidate &cand : kCandidates) {
+    cand.fn(buf.data(), buf.data(), buf.data(), 0, 2, 3);
+    cand.fn(buf.data(), buf.data(), buf.data(), 2, -1, 3);
+    cand.fn(buf.data(), buf.data(), buf.data(), 2, 2, 0);
+    cand.fn(nullptr, buf.data(), buf.data(), 2, 2, 2);
+    cand.fn(buf.data(), nullptr, buf.data(), 2, 2, 2);
+    cand.fn(buf.data(), buf.data(), nullptr, 2, 2, 2);
+  }
+  std::cout << "[PASS] dim <= 0 / nullptr safe (" << kCandidateCount
+            << " impls)\n";
+}
+
+} // namespace
+
 int main() {
   // Case1: 1x1 @ 1x1 = 1x1
-  {
-    const float a[] = {2.5f};
-    const float b[] = {4.0f};
-    float c[1], ref[1];
-    miniops::matmul(a, b, c, 1, 1, 1);
-    matmul_ref(a, b, ref, 1, 1, 1);
-    assert(allclose(c, ref, 1));
-    std::cout << "[PASS] 1x1 @ 1x1\n";
-  }
+  check_case("1x1 @ 1x1", 1, 1, 1, {2.5f}, {4.0f});
 
   // Case2: 2x3 @ 3x2 = 2x2
-  {
-    const float a[] = {1, 2, 3, 4, 5, 6};
-    const float b[] = {10, 20, 30, 40, 50, 60};
-    float c[4], ref[4];
-    miniops::matmul(a, b, c, 2, 2, 3);
-    matmul_ref(a, b, ref, 2, 2, 3);
-    assert(allclose(c, ref, 4));
-    std::cout << "[PASS] 2x3 @ 3x2\n";
-  }
+  check_case("2x3 @ 3x2", 2, 2, 3, {1, 2, 3, 4, 5, 6},
+             {10, 20, 30, 40, 50, 60});
 
   // Case3: 3x4 @ 4x5 = 3x5
-  {
-    const int m = 3, n = 5, k = 4;
-    float a[m * k], b[k * n], c[m * n], ref[m * n];
-    // 填充简单序列
-    for (int i = 0; i < m * k; i++)
-      a[i] = float(i + 1) * 0.1f;
-    for (int i = 0; i < k * n; i++)
-      b[i] = float(i + 1) * 0.2f;
-    miniops::matmul(a, b, c, m, n, k);
-    matmul_ref(a, b, ref, m, n, k);
-    assert(allclose(c, ref, m * n));
-    std::cout << "[PASS] 3x4 @ 4x5\n";
-  }
+  check_case("3x4 @ 4x5", 3, 5, 4, make_matrix(3, 4, 20, 0.1f),
+             make_matrix(4, 5, 20, 0.2f));
 
-  // Case4: 64x64 @ 64x64 = 64x64
-  {
-    const int m = 64, n = 64, k = 64;
-    float a[m * k], b[k * n], c[m * n], ref[m * n];
-    for (int i = 0; i < m * k; i++)
-      a[i] = float(i % 10);
-    for (int i = 0; i < k * n; i++)
-      b[i] = float((i + 3) % 7);
-    miniops::matmul(a, b, c, m, n, k);
-    matmul_ref(a, b, ref, m, n, k);
-    assert(allclose(c, ref, m * n));
-    std::cout << "[PASS] 64x64 @ 64x64\n";
-  }
+  // Case4: 64x64 @ 64x64
+  check_case("64x64 @ 64x64", 64, 64, 64, make_matrix(64, 64, 10, 1.0f),
+             make_matrix(64, 64, 7, 1.0f));
 
-  // Case5: 127x65 @ 65x33 = 127x33（非对称，重点！）
-  {
-    const int m = 127, n = 33, k = 65;
-    float a[m * k], b[k * n], c[m * n], ref[m * n];
-    for (int i = 0; i < m * k; i++)
-      a[i] = float(i % 13) * 0.01f;
-    for (int i = 0; i < k * n; i++)
-      b[i] = float(i % 17) * 0.02f;
-    miniops::matmul(a, b, c, m, n, k);
-    matmul_ref(a, b, ref, m, n, k);
-    assert(allclose(c, ref, m * n));
-    std::cout << "[PASS] 127x65 @ 65x33\n";
-  }
+  // Case5: 127x65 @ 65x33，非对称且三维都不能被分块大小整除
+  check_case("127x65 @ 65x33", 127, 33, 65, make_matrix(127, 65, 13, 0.01f),
+             make_matrix(65, 33, 17, 0.02f));
 
-  // ========== 边界 & 接口检查 ==========
-  // m/n/k <= 0，不崩溃
-  {
-    float dummy;
-    const float arr[] = {1, 2, 3};
-    miniops::matmul(arr, arr, &dummy, 0, 2, 3);
-    miniops::matmul(arr, arr, &dummy, 2, -1, 3);
-    miniops::matmul(arr, arr, &dummy, 2, 2, 0);
-    std::cout << "[PASS] dim <=0 safe\n";
-  }
-  // 空指针输入，不崩溃
-  {
-    float c[4];
-    miniops::matmul(nullptr, c, c, 2, 2, 2);
-    miniops::matmul(c, nullptr, c, 2, 2, 2);
-    miniops::matmul(c, c, nullptr, 2, 2, 2);
-    std::cout << "[PASS] nullptr safe\n";
-  }
+  // Case6: 37x29 @ 29x41，再覆盖一组小质数尺寸
+  check_case("37x29 @ 29x41", 37, 41, 29, make_matrix(37, 29, 11, 0.05f),
+             make_matrix(29, 41, 19, 0.03f));
 
-  std::cout << "\n✅ All matmul tests passed!\n";
+  check_invalid_inputs();
+
+  std::cout << "\n✅ All matmul tests passed (" << kCandidateCount
+            << " implementations)!\n";
   return 0;
 }
