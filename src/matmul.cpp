@@ -24,4 +24,27 @@ void matmul(const float *a, const float *b, float *c, int m, int n, int k) {
     }
   }
 }
+void matmul_ikj(const float *a, const float *b, float *c, int m, int n, int k) {
+  if (m <= 0 || n <= 0 || k <= 0)
+    return;
+  if (a == nullptr || b == nullptr || c == nullptr)
+    return;
+
+  // 必须清零！！
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < n; ++j) {
+      c[i * n + j] = 0.0f;
+    }
+  }
+
+  for (int i = 0; i < m; ++i) {
+    for (int p = 0; p < k; ++p) {
+      const float a_ip = a[i * k + p]; // 载入寄存器，只读一次
+      for (int j = 0; j < n; ++j) {
+        c[i * n + j] += a_ip * b[p * n + j];
+      }
+    }
+  }
+}
+}
 } // namespace miniops

@@ -43,3 +43,11 @@ add_executable(test_matmul
     tests/test_matmul.cpp
 )
 target_link_libraries(test_matmul PRIVATE miniops)
+
+add_executable(benchmark_matmul
+    benchmarks/benchmark_matmul.cpp
+)
+target_link_libraries(benchmark_matmul PRIVATE miniops)
+target_compile_options(benchmark_matmul PRIVATE
+    -Wall -Wextra -Wpedantic
+)
