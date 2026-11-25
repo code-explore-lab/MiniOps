@@ -13,6 +13,7 @@ add_library(miniops
     src/add.cpp
     src/reduce.cpp 
     src/softmax.cpp
+    src/matmul.cpp
 )
 
 target_include_directories(miniops
@@ -38,3 +39,7 @@ add_executable(test_softmax
     tests/test_softmax.cpp
 )
 target_link_libraries(test_softmax PRIVATE miniops)
+add_executable(test_matmul
+    tests/test_matmul.cpp
+)
+target_link_libraries(test_matmul PRIVATE miniops)
